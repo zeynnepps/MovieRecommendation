@@ -1,0 +1,7 @@
+cython>=0.29
+numpy>=1.21
+scipy>=1.7
+lightfm>=1.16
+pandas>=1.5
+scikit-learn>=1.0
+streamlit>=1.30
