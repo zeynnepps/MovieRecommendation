@@ -11,10 +11,10 @@ from sklearn.metrics.pairwise import cosine_similarity
 # Load and preprocess merged dataset
 @st.cache_data
 def load_and_prepare_data():
-    base_path = '/Users/zeynepsalihoglu/MovieRecommendation/'
-    movies = pd.read_csv(base_path + 'movies_metadata.csv', low_memory=False)
-    credits = pd.read_csv(base_path + 'credits.csv')
-    keywords = pd.read_csv(base_path + 'keywords.csv')
+    movies = pd.read_csv('movies_metadata.csv', low_memory=False)
+    credits = pd.read_csv('credits.csv')
+    keywords = pd.read_csv('keywords.csv')
+
 
     # Drop known bad rows
     movies = movies.drop([19730, 29503, 35587])
