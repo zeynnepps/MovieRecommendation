@@ -1,114 +1,118 @@
-# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
+import ast
 import re
+import string
+from sklearn.preprocessing import MinMaxScaler
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.preprocessing import MinMaxScaler
-from lightfm import LightFM
-from lightfm.data import Dataset
-from lightfm.cross_validation import random_train_test_split
 
-st.set_page_config(page_title="Hybrid Movie Recommender", layout="centered")
-
-# --- Load MovieLens 100K ---
+# Load and preprocess merged dataset
 @st.cache_data
-def load_data():
-    base_path = './ml-100k/'
-    ratings = pd.read_csv(base_path + 'u.data', sep='\t', names=['user_id', 'item_id', 'rating', 'timestamp'])
-    movies = pd.read_csv(base_path + 'u.item', sep='|', encoding='latin-1', names=[
-        'movie_id', 'movie_title', 'release_date', 'video_release_date', 'IMDb_URL',
-        'unknown', 'Action', 'Adventure', 'Animation', "Children's", 'Comedy', 'Crime',
-        'Documentary', 'Drama', 'Fantasy', 'Film-Noir', 'Horror', 'Musical', 'Mystery',
-        'Romance', 'Sci-Fi', 'Thriller', 'War', 'Western'
-    ])
-    return ratings, movies
+def load_and_prepare_data():
+    base_path = '/Users/zeynepsalihoglu/MovieRecommendation/'
+    movies = pd.read_csv(base_path + 'movies_metadata.csv', low_memory=False)
+    credits = pd.read_csv(base_path + 'credits.csv')
+    keywords = pd.read_csv(base_path + 'keywords.csv')
 
-ratings, movies = load_data()
+    # Drop known bad rows
+    movies = movies.drop([19730, 29503, 35587])
+    movies['id'] = movies['id'].astype('int64')
+    
+    # Merge
+    df = movies.merge(keywords, on='id').merge(credits, on='id')
+    df['original_language'] = df['original_language'].fillna('')
+    df['runtime'] = df['runtime'].fillna(0)
+    df['tagline'] = df['tagline'].fillna('')
+    df.dropna(inplace=True)
 
-# --- Build Content-Based Model ---
-genre_cols = movies.columns[5:]
-movies["genres"] = movies[genre_cols].apply(lambda row: " ".join([col for col, val in zip(genre_cols, row) if val == 1]), axis=1)
+    # Convert types
+    df['release_date'] = pd.to_datetime(df['release_date'], errors='coerce')
+    df['budget'] = df['budget'].astype('float64')
+    df['popularity'] = df['popularity'].astype('float64')
+    df['vote_average'] = df['vote_average'].astype('float64')
+    df['vote_count'] = df['vote_count'].astype('float64')
+    
+    return df
 
-tfidf = TfidfVectorizer(stop_words='english')
-tfidf_matrix = tfidf.fit_transform(movies["genres"])
-cosine_sim = cosine_similarity(tfidf_matrix, tfidf_matrix)
+df = load_and_prepare_data()
 
-# --- Build Collaborative Model ---
-dataset = Dataset()
-dataset.fit(ratings["user_id"].unique(), ratings["item_id"].unique())
+# Calculate weighted average
+R = df['vote_average']
+v = df['vote_count']
+m = df['vote_count'].quantile(0.8)
+C = df['vote_average'].mean()
+df['weighted_average'] = (R * v + C * m) / (v + m)
 
-item_mapping = dict(dataset.mapping()[1])
-item_inv_mapping = {v: k for k, v in item_mapping.items()}
+# Normalize
+scaler = MinMaxScaler()
+scaled = scaler.fit_transform(df[['popularity', 'weighted_average']])
+weighted_df = pd.DataFrame(scaled, columns=['popularity', 'weighted_average'])
+weighted_df.index = df['original_title']
+weighted_df['score'] = weighted_df['weighted_average'] * 0.4 + weighted_df['popularity'] * 0.6
+weighted_df_sorted = weighted_df.sort_values(by='score', ascending=False)
 
-(interactions, _) = dataset.build_interactions(
-    ((row["user_id"], row["item_id"], row["rating"]) for _, row in ratings.iterrows())
-)
-
-train, _ = random_train_test_split(interactions, test_percentage=0.2)
-model = LightFM(loss='warp', no_components=32, learning_rate=0.05)
-model.fit(train, epochs=10, num_threads=4)
-
-# --- NLP Parser ---
-def parse_user_input(text):
-    user_id_match = re.search(r'user\s*(number)?\s*(\d+)', text.lower())
-    user_id = int(user_id_match.group(2)) if user_id_match else None
-
-    movie_match = re.search(r'liked\s+(.*?)\s+(and|i\'m)', text, re.IGNORECASE)
-    movie_title = movie_match.group(1).strip() if movie_match else None
-
-    return user_id, movie_title
-
-# --- Hybrid Recommendation Function ---
-def hybrid_recommend(user_id, movie_title, alpha=0.5, top_n=10):
+# Helpers to parse and clean
+def parse_list(s):
     try:
-        idx = movies[movies["movie_title"] == movie_title].index[0]
-    except IndexError:
-        st.error("❌ Movie title not found.")
-        return pd.DataFrame()
+        return ' '.join([i['name'].replace(' ', '').lower() for i in ast.literal_eval(s)])
+    except:
+        return ''
 
-    cb_scores = cosine_sim[idx]
+def clean_text(text):
+    cleaned = str(text).translate(str.maketrans('', '', string.punctuation)).lower()
+    return cleaned.translate(str.maketrans('', '', string.digits))
 
-    movie_ids = movies["movie_id"].tolist()
-    known_ids = [mid for mid in movie_ids if mid in item_mapping]
-    internal_ids = [item_mapping[mid] for mid in known_ids]
+# Extract features
+df['genres_clean'] = df['genres'].apply(parse_list)
+df['keywords_clean'] = df['keywords'].apply(parse_list)
+df['cast_clean'] = df['cast'].apply(lambda x: ' '.join([i['name'].replace(' ', '').lower() for i in ast.literal_eval(x)][:3]) if pd.notnull(x) else '')
+df['crew_clean'] = df['crew'].apply(lambda x: ' '.join([i['name'].replace(' ', '').lower() for i in ast.literal_eval(x) if i['job'] == 'Director']) if pd.notnull(x) else '')
+df['overview_clean'] = df['overview'].apply(clean_text)
+df['tagline_clean'] = df['tagline'].apply(clean_text)
 
-    user_ids = [user_id] * len(internal_ids)
-    cf_scores = model.predict(user_ids, internal_ids)
+# Build content dataframe
+content_df = pd.DataFrame()
+content_df['original_title'] = df['original_title']
+content_df['bag_of_words'] = df['genres_clean'] + ' ' + df['keywords_clean'] + ' ' + df['cast_clean'] + ' ' + df['crew_clean'] + ' ' + df['overview_clean'] + ' ' + df['tagline_clean']
+content_df.set_index('original_title', inplace=True)
 
-    cb_scores = [cb_scores[movies[movies["movie_id"] == mid].index[0]] for mid in known_ids]
+# Merge top 10k with scores
+content_df = weighted_df_sorted[:10000].merge(content_df, left_index=True, right_index=True, how='left')
 
-    cb_scaled = MinMaxScaler().fit_transform(np.array(cb_scores).reshape(-1, 1)).flatten()
-    cf_scaled = MinMaxScaler().fit_transform(cf_scores.reshape(-1, 1)).flatten()
+# TF-IDF and similarity
+tfidf = TfidfVectorizer(stop_words='english', min_df=5)
+tfidf_matrix = tfidf.fit_transform(content_df['bag_of_words'])
+cos_sim = cosine_similarity(tfidf_matrix)
 
-    final_scores = alpha * cb_scaled + (1 - alpha) * cf_scaled
-    top_indices = np.argsort(final_scores)[::-1][:top_n]
+# Recommendation function
+def predict(title, similarity_weight=0.7, top_n=10):
+    data = content_df.reset_index()
+    if title not in data['original_title'].values:
+        return None
+    idx = data[data['original_title'] == title].index[0]
+    similarity = cos_sim[idx]
+    sim_df = pd.DataFrame({'similarity': similarity})
+    final_df = pd.concat([data, sim_df], axis=1)
+    final_df['final_score'] = final_df['score'] * (1 - similarity_weight) + final_df['similarity'] * similarity_weight
+    final_df_sorted = final_df.sort_values(by='final_score', ascending=False).head(top_n)
+    final_df_sorted.set_index('original_title', inplace=True)
+    return final_df_sorted[['score', 'similarity', 'final_score']]
 
-    top_movie_ids = [known_ids[i] for i in top_indices]
-    return movies[movies["movie_id"].isin(top_movie_ids)][["movie_title", "genres"]]
+# Streamlit UI
+st.title("🎥 Movie Recommendation App")
+st.markdown("Choose a movie to get personalized content-based recommendations!")
 
-# --- Streamlit UI ---
-st.title("🎬 Hybrid Movie Recommender System")
+movie_list = content_df.index.tolist()
+selected_movie = st.selectbox("Select a movie:", sorted(movie_list))
+sim_weight = st.slider("Similarity Weight", 0.0, 1.0, 0.7, 0.1)
+top_n = st.slider("Top N Recommendations", 5, 20, 10)
 
-st.markdown("""
-Enter something like:  
-`I liked Toy Story (1995) and I’m user number 10`
-""")
-
-user_input = st.text_input("Your sentence:")
-alpha = st.slider("🔄 Content-Based Weight (α)", min_value=0.0, max_value=1.0, value=0.5, step=0.05)
-
-if st.button("🎥 Recommend"):
-    user_id, movie_title = parse_user_input(user_input)
-    if user_id is not None and movie_title is not None:
-        movie_title_match = movies[movies["movie_title"].str.lower() == movie_title.lower()]
-        if not movie_title_match.empty:
-            correct_title = movie_title_match.iloc[0]["movie_title"]
-            st.success(f"Recommending for user **{user_id}** based on movie: **{correct_title}**")
-            recs = hybrid_recommend(user_id, correct_title, alpha)
-            st.dataframe(recs)
-        else:
-            st.warning(f"❌ Movie '{movie_title}' not found. Try an exact title from MovieLens dataset.")
+if st.button("Get Recommendations"):
+    result = predict(selected_movie, similarity_weight=sim_weight, top_n=top_n)
+    if result is not None:
+        st.subheader(f"Top {top_n} Recommendations for '{selected_movie}':")
+        st.dataframe(result.style.format({"score": "{:.2f}", "similarity": "{:.2f}", "final_score": "{:.2f}"}))
     else:
-        st.warning("⚠️ Could not parse user input. Use format like: I liked Titanic and I’m user 5")
+        st.error("❌ Movie not found in the dataset.")
